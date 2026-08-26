@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from db import NodeStatus, SensorReading, get_db, init_db, utcnow
 from pipeline import clean_payload, refresh_node_liveness, sweep_dead_nodes
+from risk_engine import evaluate_risk
 
 app = FastAPI(title="SIH 26192 — Ridge & Valley Flood/Landslide Backend")
 
@@ -50,14 +51,29 @@ class ReadingOut(BaseModel):
         from_attributes = True
 
 
+class StatusOut(ReadingOut):
+    """ReadingOut plus the Phase 4 risk verdict — every intermediate number included so
+    the level is auditable, not just asserted."""
+
+    level: str              # NORMAL / WATCH / ALERT / CRITICAL — max(flood_level, landslide_level)
+    flood_level: str
+    landslide_level: str
+    dh_dt_cm_per_s: float | None
+    theta_deep_pct: float | None
+    tilt_delta_deg: float | None
+    tilt_rate_deg_per_hr: float | None
+    rain_duration_min: float
+
+
 @app.post("/ingest", response_model=ReadingOut)
 def ingest(payload: IngestPayload, db: Session = Depends(get_db)):
     """Store one combined payload from Node B, self-heal it, and refresh its liveness record.
 
     Self-healing (Phase 3): Z-score outlier rejection per channel, IDW fill for a dead
     soil sensor from its depth neighbours, and a sweep marking any node DEAD if it's
-    gone silent past the 15s offline threshold. Risk scoring (Phase 4) is not wired
-    in yet — this endpoint stores the cleaned reading.
+    gone silent past the 15s offline threshold. The Phase 4 risk verdict is computed
+    on demand in GET /status rather than here, so it always reflects the latest data
+    a caller actually asked for.
     """
     now = utcnow()
     cleaned = clean_payload(db, payload.model_dump())
@@ -76,10 +92,12 @@ def ingest(payload: IngestPayload, db: Session = Depends(get_db)):
     return _to_reading_out(reading, status)
 
 
-@app.get("/status/{village_id}", response_model=ReadingOut)
+@app.get("/status/{village_id}", response_model=StatusOut)
 def get_status(village_id: str, db: Session = Depends(get_db)):
-    """Latest stored reading for a node. `village_id` == the node_id Node B sends."""
-    sweep_dead_nodes(db, utcnow())
+    """Latest stored reading for a node, plus the current Phase 4 risk verdict.
+    `village_id` == the node_id Node B sends."""
+    now = utcnow()
+    sweep_dead_nodes(db, now)
     db.commit()
 
     reading = (
@@ -92,14 +110,19 @@ def get_status(village_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=f"No readings for node '{village_id}'")
 
     status = db.get(NodeStatus, village_id)
-    return _to_reading_out(reading, status)
+    risk = evaluate_risk(db, village_id, now)
+    return StatusOut(**_reading_fields(reading, status), **risk)
 
 
-def _to_reading_out(reading: SensorReading, status: NodeStatus) -> ReadingOut:
+def _reading_fields(reading: SensorReading, status: NodeStatus) -> dict:
     fields = {
         col: getattr(reading, col)
         for col in ReadingOut.model_fields
         if col != "node_dead" and hasattr(reading, col)
     }
     fields["node_dead"] = bool(status.is_dead) if status else False
-    return ReadingOut(**fields)
+    return fields
+
+
+def _to_reading_out(reading: SensorReading, status: NodeStatus) -> ReadingOut:
+    return ReadingOut(**_reading_fields(reading, status))
