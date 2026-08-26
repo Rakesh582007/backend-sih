@@ -2,8 +2,15 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
+
+
+def utcnow() -> datetime:
+    """Naive UTC 'now'. SQLite's DATETIME column drops tzinfo on round-trip, so every
+    datetime this app produces or compares is kept naive-but-UTC-by-convention to avoid
+    aware/naive comparison bugs between freshly-created and stored values."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 DATABASE_URL = "sqlite:///./sih.db"
 
@@ -40,7 +47,11 @@ class SensorReading(Base):
     water_level = Column(Float, nullable=False)
     battery = Column(Float, nullable=False)
 
-    received_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    # Comma-separated notes from the self-healing pipeline (Phase 3), e.g. an IDW fill
+    # or a flagged-but-not-corrected tilt/water_level spike. Empty string if nothing fired.
+    flags = Column(Text, nullable=False, default="")
+
+    received_at = Column(DateTime, default=utcnow)
 
 
 class NodeStatus(Base):

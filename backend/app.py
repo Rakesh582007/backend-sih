@@ -1,12 +1,13 @@
 """FastAPI app: /ingest (Node B posts here every cycle) and /status/{village_id} (dashboard polls this)."""
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from db import NodeStatus, SensorReading, get_db, init_db
+from db import NodeStatus, SensorReading, get_db, init_db, utcnow
+from pipeline import clean_payload, refresh_node_liveness, sweep_dead_nodes
 
 app = FastAPI(title="SIH 26192 — Ridge & Valley Flood/Landslide Backend")
 
@@ -42,6 +43,8 @@ class ReadingOut(BaseModel):
     rain_state: bool
     water_level: float
     battery: float
+    flags: str        # notes from the self-healing pipeline, e.g. an IDW fill; "" if none fired
+    node_dead: bool    # NodeStatus.is_dead as of this response (>15s since last ingest)
 
     class Config:
         from_attributes = True
@@ -49,32 +52,36 @@ class ReadingOut(BaseModel):
 
 @app.post("/ingest", response_model=ReadingOut)
 def ingest(payload: IngestPayload, db: Session = Depends(get_db)):
-    """Store one combined payload from Node B and refresh its liveness record.
+    """Store one combined payload from Node B, self-heal it, and refresh its liveness record.
 
-    NOTE: this is the raw store step (Phase 2). Outlier rejection / dead-node
-    handling / IDW fill (Phase 3) and risk scoring (Phase 4) are not wired in
-    here yet — this endpoint just persists what it's given.
+    Self-healing (Phase 3): Z-score outlier rejection per channel, IDW fill for a dead
+    soil sensor from its depth neighbours, and a sweep marking any node DEAD if it's
+    gone silent past the 15s offline threshold. Risk scoring (Phase 4) is not wired
+    in yet — this endpoint stores the cleaned reading.
     """
-    reading = SensorReading(**payload.model_dump())
+    now = utcnow()
+    cleaned = clean_payload(db, payload.model_dump())
+    flags = cleaned.pop("_flags")
+
+    reading = SensorReading(**cleaned, flags="; ".join(flags))
     db.add(reading)
 
-    now = datetime.now(timezone.utc)
-    status = db.get(NodeStatus, payload.node_id)
-    if status is None:
-        status = NodeStatus(node_id=payload.node_id, last_seen=now, is_dead=False)
-        db.add(status)
-    else:
-        status.last_seen = now
-        status.is_dead = False
+    refresh_node_liveness(db, payload.node_id, now)
+    sweep_dead_nodes(db, now)  # covers every known node, not just this one
 
     db.commit()
     db.refresh(reading)
-    return reading
+
+    status = db.get(NodeStatus, payload.node_id)
+    return _to_reading_out(reading, status)
 
 
 @app.get("/status/{village_id}", response_model=ReadingOut)
 def get_status(village_id: str, db: Session = Depends(get_db)):
     """Latest stored reading for a node. `village_id` == the node_id Node B sends."""
+    sweep_dead_nodes(db, utcnow())
+    db.commit()
+
     reading = (
         db.query(SensorReading)
         .filter(SensorReading.node_id == village_id)
@@ -83,4 +90,16 @@ def get_status(village_id: str, db: Session = Depends(get_db)):
     )
     if reading is None:
         raise HTTPException(status_code=404, detail=f"No readings for node '{village_id}'")
-    return reading
+
+    status = db.get(NodeStatus, village_id)
+    return _to_reading_out(reading, status)
+
+
+def _to_reading_out(reading: SensorReading, status: NodeStatus) -> ReadingOut:
+    fields = {
+        col: getattr(reading, col)
+        for col in ReadingOut.model_fields
+        if col != "node_dead" and hasattr(reading, col)
+    }
+    fields["node_dead"] = bool(status.is_dead) if status else False
+    return ReadingOut(**fields)
