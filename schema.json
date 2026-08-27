@@ -1,0 +1,168 @@
+{
+  "_README": "GiriKavach shared data contract v1.0. THIS FILE IS THE SINGLE SOURCE OF TRUTH. Neither developer changes a field name, unit, or enum value without the other agreeing in the PR. Schema drift between the FastAPI backend and the XGBoost/Streamlit side is the #1 integration risk on this project.",
+  "version": "1.0.0",
+  "frozen_at": "2026-08-27",
+
+  "sensor_reading": {
+    "_description": "One merged sample. Node 1 (mountain, via LoRa) + Node 2 (gateway, local sensors). This is the POST body for /ingest.",
+
+    "node_id": {
+      "type": "string",
+      "example": "GK-MEPPADI-01",
+      "required": true,
+      "_note": "Every reading must carry node identity. Needed so the PWA can filter alerts to the user's valley."
+    },
+    "timestamp_utc": {
+      "type": "string",
+      "format": "ISO 8601 with UTC offset",
+      "example": "2026-08-27T14:32:00+00:00",
+      "required": true,
+      "_note": "ALWAYS UTC on the wire. Convert to IST for display only, never in storage or transport."
+    },
+    "latitude": { "type": "float", "example": 11.4654, "required": true },
+    "longitude": { "type": "float", "example": 76.1358, "required": true },
+
+    "rain_intensity_mm_hr": {
+      "type": "float", "unit": "mm/hour", "range": [0, 180], "source": "node1"
+    },
+    "rain_duration_min": {
+      "type": "float", "unit": "minutes", "range": [0, 720], "source": "node1",
+      "_note": "Minutes of continuous active rain in the current event, not total uptime."
+    },
+
+    "soil_moisture_profile": {
+      "_description": "RECONCILED FIELD. Rakesh's dashboard uses a 5-depth profile; the ML models and firmware use a single deep value. Node reports ALL depths; deep_soil_moisture_pct is DERIVED from them by the backend so both consumers are satisfied from one source.",
+      "soil_moisture_10cm_pct": { "type": "float", "unit": "percent VWC", "range": [0, 100] },
+      "soil_moisture_30cm_pct": { "type": "float", "unit": "percent VWC", "range": [0, 100] },
+      "soil_moisture_60cm_pct": { "type": "float", "unit": "percent VWC", "range": [0, 100] },
+      "soil_moisture_100cm_pct": { "type": "float", "unit": "percent VWC", "range": [0, 100] },
+      "soil_moisture_150cm_pct": { "type": "float", "unit": "percent VWC", "range": [0, 100] }
+    },
+    "deep_soil_moisture_pct": {
+      "type": "float", "unit": "percent VWC", "range": [0, 100],
+      "_derivation": "Weighted mean of the 30cm/60cm/100cm layers (the slip-plane band), weights 0.25/0.45/0.30. Computed by the backend, NOT sent by the node. If only one physical sensor exists (current hardware), it reports into soil_moisture_30cm_pct and this value equals it.",
+      "_note": "This is the field BOTH ML models consume. Do not change its meaning."
+    },
+
+    "slope_pitch_deg": {
+      "type": "float", "unit": "degrees", "range": [0, 65], "source": "node1",
+      "_note": "From MPU6050 pitch. Static site slope can also be pre-loaded from Bhuvan DEM as a fallback."
+    },
+    "pitch_rate_deg_min": {
+      "type": "float", "unit": "degrees/minute", "range": [0, 6], "source": "node1",
+      "_note": "Rate of tilt change = creep signal."
+    },
+    "vibration_intensity": {
+      "type": "float", "unit": "dimensionless 0-100", "range": [0, 100], "source": "node1",
+      "_note": "SW-420 pulse count over a rolling 15s window, normalized."
+    },
+    "gyro_angular_vel_deg_s": {
+      "type": "float", "unit": "degrees/second", "range": [0, 30], "source": "node1"
+    },
+
+    "stream_depth_cm": {
+      "type": "float", "unit": "centimetres", "range": [0, 500], "source": "node2",
+      "_note": "Water depth = sensor_mount_height - ultrasonic_distance. Median-filtered over 10 readings before use."
+    },
+    "rate_of_rise_cm_min": {
+      "type": "float", "unit": "cm/minute", "range": [-5, 40], "source": "node2_derived",
+      "_note": "dh/dt from consecutive depth readings. >5 cm/min triggers the dam-break safety net REGARDLESS of ML output."
+    },
+
+    "node1_link_fresh": {
+      "type": "boolean", "default": true,
+      "_note": "False when no LoRa packet in 5 min. When false, landslide inference is SKIPPED (all its features originate at node1) — this is NOT a low-risk finding."
+    },
+    "battery_voltage": { "type": "float", "unit": "volts", "required": false },
+    "rssi_dbm": { "type": "integer", "unit": "dBm", "required": false }
+  },
+
+  "ml_feature_vectors": {
+    "_description": "EXACT ordered feature lists. Both the XGBoost models and the TFLM models consume these in THIS ORDER. Changing the order silently corrupts predictions with no error.",
+    "flood_model": [
+      "rain_intensity_mm_hr",
+      "rain_duration_min",
+      "deep_soil_moisture_pct",
+      "stream_depth_cm",
+      "rate_of_rise_cm_min"
+    ],
+    "landslide_model": [
+      "deep_soil_moisture_pct",
+      "slope_pitch_deg",
+      "pitch_rate_deg_min",
+      "vibration_intensity",
+      "gyro_angular_vel_deg_s"
+    ],
+    "output": {
+      "type": "float", "unit": "percent probability", "range": [0, 100],
+      "_note": "Regressor output, clamped to [0,100] by the backend."
+    }
+  },
+
+  "risk_tiers": {
+    "_description": "ONE source of truth. Identical strings in firmware, backend, dashboard, PWA, and CAP mapping.",
+    "NORMAL":   { "ordinal": 0, "ml_threshold_pct": 0,  "siren": false },
+    "WATCH":    { "ordinal": 1, "ml_threshold_pct": 50, "siren": false },
+    "ALERT":    { "ordinal": 2, "ml_threshold_pct": 70, "siren": true  },
+    "CRITICAL": { "ordinal": 3, "ml_threshold_pct": 85, "siren": true  }
+  },
+
+  "cap_mapping": {
+    "_description": "Internal tier -> CAP 1.2 controlled vocabulary. certainty is never 'Observed' from a prediction alone.",
+    "CRITICAL": { "severity": "Extreme",  "urgency": "Immediate", "certainty": "Likely" },
+    "ALERT":    { "severity": "Severe",   "urgency": "Immediate", "certainty": "Likely" },
+    "WATCH":    { "severity": "Moderate", "urgency": "Expected",  "certainty": "Possible" },
+    "NORMAL":   { "severity": "Minor",    "urgency": "Future",    "certainty": "Unlikely" },
+    "category": { "landslide": "Geo", "flood": "Met" },
+    "default_status": "Exercise",
+    "_status_note": "NEVER default to 'Actual'. CAP is consumed by real emergency infrastructure; a demo payload marked Actual is a false emergency claim."
+  },
+
+  "safety_net_thresholds": {
+    "_description": "Raw-physics overrides. These fire the siren REGARDLESS of ML output, and bypass hysteresis. Defence against a silently-wrong model (e.g. the rainless GLOF case).",
+    "soil_saturation_pct": 92.0,
+    "slope_deg": 38.0,
+    "rate_of_rise_cm_min": 5.0
+  },
+
+  "false_positive_gates": {
+    "_description": "Suppression thresholds. See backend/false_positive_filter.py.",
+    "saturation_gate_pct": 85.0,
+    "slope_gate_deg": 25.0,
+    "consecutive_to_escalate": 3,
+    "consecutive_to_deescalate": 6,
+    "depth_median_window": 10,
+    "tilt_drift_deg": 1.5,
+    "stuck_sensor_cycles": 30
+  },
+
+  "api_endpoints": {
+    "_description": "Backend contract. Rakesh's dashboard and the PWA both consume these.",
+    "POST /ingest": "Accepts sensor_reading, returns decision object",
+    "GET /status": "Latest decision",
+    "GET /history?limit=N": "Recent decisions for charts",
+    "GET /alert/cap?status_value=Exercise": "CAP 1.2 XML",
+    "GET /health": "Service + model load state",
+    "POST /filter/reset": "Clear hysteresis state (demo aid)"
+  },
+
+  "decision_object": {
+    "_description": "What /ingest and /status return. This is what the dashboard and PWA render.",
+    "timestamp": "string, ISO 8601 +05:30",
+    "node_id": "string",
+    "risk_level": "one of NORMAL|WATCH|ALERT|CRITICAL",
+    "flood_probability": "float 0-100",
+    "landslide_probability": "float 0-100",
+    "should_sound_siren": "boolean",
+    "safety_net_triggered": "boolean",
+    "reasons": "array of strings — why it escalated",
+    "suppressed": "array of strings — what was rejected and why",
+    "sensor_health_warnings": "array of strings"
+  },
+
+  "heartbeat": {
+    "interval_seconds": 30,
+    "stale_after_seconds": 300,
+    "_note": "Dashboard and PWA both use stale_after_seconds to show the node-offline chip. One value, both consumers."
+  }
+}
