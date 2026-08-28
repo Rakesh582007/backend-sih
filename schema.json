@@ -31,17 +31,17 @@
     },
 
     "soil_moisture_profile": {
-      "_description": "RECONCILED FIELD. Rakesh's dashboard uses a 5-depth profile; the ML models and firmware use a single deep value. Node reports ALL depths; deep_soil_moisture_pct is DERIVED from them by the backend so both consumers are satisfied from one source.",
-      "soil_moisture_10cm_pct": { "type": "float", "unit": "percent VWC", "range": [0, 100] },
-      "soil_moisture_30cm_pct": { "type": "float", "unit": "percent VWC", "range": [0, 100] },
-      "soil_moisture_60cm_pct": { "type": "float", "unit": "percent VWC", "range": [0, 100] },
-      "soil_moisture_100cm_pct": { "type": "float", "unit": "percent VWC", "range": [0, 100] },
-      "soil_moisture_150cm_pct": { "type": "float", "unit": "percent VWC", "range": [0, 100] }
+      "_description": "RECONCILED FIELD, updated at merge time to match the actual implemented wire format (main.py's TelemetryIn / db.py's SensorReading / pipeline.py's SOIL_CHANNELS all agree on soil_1..soil_5 — this schema previously documented a different, never-implemented soil_moisture_XXcm_pct naming). Node reports ALL 5 depths; deep_soil_moisture_pct is DERIVED from them by the backend (risk_engine.theta_deep_pct()) so both the self-healing pipeline and the ML models are satisfied from one source.",
+      "soil_1": { "type": "float", "unit": "percent VWC", "range": [0, 100], "depth_cm": 10 },
+      "soil_2": { "type": "float", "unit": "percent VWC", "range": [0, 100], "depth_cm": 30 },
+      "soil_3": { "type": "float", "unit": "percent VWC", "range": [0, 100], "depth_cm": 60 },
+      "soil_4": { "type": "float", "unit": "percent VWC", "range": [0, 100], "depth_cm": 100 },
+      "soil_5": { "type": "float", "unit": "percent VWC", "range": [0, 100], "depth_cm": 150 }
     },
     "deep_soil_moisture_pct": {
       "type": "float", "unit": "percent VWC", "range": [0, 100],
-      "_derivation": "Weighted mean of the 30cm/60cm/100cm layers (the slip-plane band), weights 0.25/0.45/0.30. Computed by the backend, NOT sent by the node. If only one physical sensor exists (current hardware), it reports into soil_moisture_30cm_pct and this value equals it.",
-      "_note": "This is the field BOTH ML models consume. Do not change its meaning."
+      "_derivation": "theta_deep_pct = soil_4*0.4 + soil_5*0.6 (the 100cm/150cm layers, the actual slip-plane band) — see risk_engine.py's DEEP_SOIL_WEIGHTS and theta_deep_pct(). Computed by the backend from the CLEANED (post self-healing) soil_4/soil_5, NOT sent by the node. This corrects an earlier speculative guess in this file (a 30/60/100cm weighted mean, weights 0.25/0.45/0.30) that was never what risk_engine.py actually implemented — that version was written before the two backends were merged and the real formula was confirmed.",
+      "_note": "This is the field BOTH ML models AND the false-positive filter's saturation gate consume. Do not change its meaning without updating risk_engine.py, false_positive_filter.py, and main.py's XGBoost feature dict together — they must never drift apart."
     },
 
     "slope_pitch_deg": {
@@ -126,7 +126,7 @@
   },
 
   "false_positive_gates": {
-    "_description": "Suppression thresholds. See backend/false_positive_filter.py.",
+    "_description": "Suppression thresholds. See false_positive_filter.py (root — merged into main.py, not under backend/).",
     "saturation_gate_pct": 85.0,
     "slope_gate_deg": 25.0,
     "consecutive_to_escalate": 3,
@@ -137,11 +137,14 @@
   },
 
   "api_endpoints": {
-    "_description": "Backend contract. Rakesh's dashboard and the PWA both consume these.",
-    "POST /ingest": "Accepts sensor_reading, returns decision object",
+    "_description": "Backend contract, as of the merge into a single main.py. Rakesh's dashboard and the PWA both consume these. Persistence (SensorReading + Decision rows) happens as a fire-and-forget background task on every /ingest call — it is not a separate endpoint.",
+    "POST /ingest": "Accepts sensor_reading (soil_1..soil_5 + the rest), returns decision object",
     "GET /status": "Latest decision",
     "GET /history?limit=N": "Recent decisions for charts",
     "GET /alert/cap?status_value=Exercise": "CAP 1.2 XML",
+    "GET /alert/text?language=en": "Citizen alert wording in a given language, from alert_templates.py",
+    "GET /sitrep": "Plain-language LLM ops summary (English only, internal)",
+    "GET /prearm": "Current Open-Meteo pre-arm state",
     "GET /health": "Service + model load state",
     "POST /filter/reset": "Clear hysteresis state (demo aid)"
   },
@@ -153,11 +156,15 @@
     "risk_level": "one of NORMAL|WATCH|ALERT|CRITICAL",
     "flood_probability": "float 0-100",
     "landslide_probability": "float 0-100",
+    "theta_deep_pct": "float 0-100 — the deep_soil_moisture_pct actually fed into both the ML models and the filter, exposed for audit",
     "should_sound_siren": "boolean",
     "safety_net_triggered": "boolean",
     "reasons": "array of strings — why it escalated",
     "suppressed": "array of strings — what was rejected and why",
-    "sensor_health_warnings": "array of strings"
+    "sensor_health_warnings": "array of strings — merges the filter's own findings with self-healing's imputation notes, so imputed values are never silently indistinguishable from real ones",
+    "alert_text": "string or null — citizen-facing wording from alert_templates.py, present only at WATCH tier or above",
+    "alert_text_source": "string or null — always \"template\" (see llm_narrator.py; the LLM never writes citizen-facing text)",
+    "prearm_active": "boolean — whether Open-Meteo pre-arm is currently raising sensitivity"
   },
 
   "heartbeat": {
